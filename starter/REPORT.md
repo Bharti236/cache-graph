@@ -2,19 +2,18 @@
 
 ## Summary
 
-This assignment is now implemented in the required starter code. I completed the three missing functions:
+This assignment is fully implemented in the required starter code. I completed the three missing functions:
 
 - `src/bfs_pointer.c`
 - `src/graph_csr.c`
 - `src/bfs_csr.c`
 
-I also added short code comments in the key traversal and conversion loops so the logic is easier to follow.
-
 The finished code:
 
 - builds successfully with `make`
 - passes all provided visible BFS correctness tests
-- shows a clear runtime advantage for the CSR representation on a larger generated graph
+- passes small Valgrind Memcheck smoke tests with no leaks or memory errors
+- shows a clear runtime and cache-miss advantage for the CSR representation
 
 ## What I Implemented
 
@@ -102,6 +101,18 @@ That confirms:
 - duplicate edges do not break BFS
 - cycles and disconnected components are handled correctly
 
+I also ran small Valgrind Memcheck smoke tests for both implementations:
+
+```bash
+valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all ./graph_bench --impl=pointer --graph=tests/test_small.txt --source=0
+valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all ./graph_bench --impl=csr --graph=tests/test_small.txt --source=0
+```
+
+Both runs reported:
+
+- `ERROR SUMMARY: 0 errors from 0 contexts`
+- `All heap blocks were freed -- no leaks are possible`
+
 ## Runtime Comparison
 
 ### Benchmark setup
@@ -112,62 +123,55 @@ I generated a larger Erdos-Renyi style graph with:
 python3 scripts/gen_graph.py --kind er --n 50000 --deg 8 --seed 1 --out /tmp/cache_graph_er_50000_d8.txt
 ```
 
-Then I benchmarked both implementations with the provided program:
+Then I benchmarked both implementations three times:
 
 ```bash
 ./graph_bench --impl=pointer --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=500
 ./graph_bench --impl=csr --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=500
 ```
 
-Observed output:
+Observed results:
 
-| Implementation | Visited | Total time for 500 runs | Approx. time per BFS |
-| --- | ---: | ---: | ---: |
-| Pointer graph | 49983 | 7675.59 ms | 15.351 ms |
-| CSR graph | 49983 | 1527.76 ms | 3.056 ms |
+| Implementation | Run 1 total | Run 2 total | Run 3 total | Average total | Approx. time per BFS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pointer graph | 2905.49 ms | 2614.34 ms | 2609.53 ms | 2709.79 ms | 5.420 ms |
+| CSR graph | 813.24 ms | 850.13 ms | 793.18 ms | 818.85 ms | 1.638 ms |
 
 ### Answer to Question 1
 
 CSR was faster.
 
-- Speedup: about `5.02x`
-- Time reduction: about `80.1%`
+- Average speedup: about `3.31x`
+- Average time reduction: about `69.8%`
 
-This is especially notable because the provided benchmark includes the one-time `convert_to_csr(...)` cost in the CSR timing path. That means the BFS traversal itself is likely even more favorable to CSR when the same converted graph is reused for many searches.
+This is still notable because the provided benchmark includes the one-time `convert_to_csr(...)` cost in the CSR timing path. If the same converted graph were reused for many BFS traversals, CSR would likely look even better.
 
 ## Cache Behavior Analysis
 
-### Environment limitation
+### Benchmark setup
 
-The assignment asks for Cachegrind analysis, but this environment does not have `valgrind` installed:
+To make the Cachegrind runs reproducible, I used an explicit L1 data-cache configuration instead of relying on host defaults:
 
 ```bash
-valgrind --version
+valgrind --tool=cachegrind --cache-sim=yes --D1=32768,8,64 ./graph_bench --impl=pointer --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=10
+valgrind --tool=cachegrind --cache-sim=yes --D1=32768,8,64 ./graph_bench --impl=csr --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=10
 ```
 
-Result:
+Miss totals under that configuration:
 
-```text
-/bin/bash: line 1: valgrind: command not found
-```
-
-Because of that, I could not produce measured `D1 misses` and `LLd misses` in this workspace.
+| Implementation | D1 misses | LLd misses |
+| --- | ---: | ---: |
+| Pointer graph | 7,195,870 | 1,802,208 |
+| CSR graph | 5,889,600 | 769,233 |
 
 ### Answer to Question 2
 
-Even without Cachegrind numbers, the implementation strongly suggests that CSR should generate fewer cache misses than the pointer-based graph.
+CSR generated fewer data-cache misses at both levels.
 
-Reason:
+- D1 misses dropped by about `18.2%`
+- LLd misses dropped by about `57.3%`
 
-- The pointer graph stores each edge in a separately allocated linked-list node.
-- BFS on that layout repeatedly follows `next` pointers, which can jump to unrelated memory locations.
-- CSR stores all edges in one compact integer array.
-- When BFS scans neighbors in CSR, it reads memory sequentially, which fits how hardware caches and prefetchers work.
-
-Expected outcome:
-
-- CSR should have fewer `D1` misses than the pointer graph.
-- CSR should also usually have fewer `LLd` misses, especially on larger graphs where adjacency data no longer fits in the smallest caches.
+The reason is that CSR stores adjacency data in contiguous arrays, so BFS can scan neighbors sequentially. The pointer representation must chase linked-list nodes that were allocated separately on the heap, which leads to less predictable memory access and more cache misses.
 
 ## Memory Layout Explanation
 
@@ -192,20 +196,46 @@ So even though both BFS implementations are still `O(V + E)`, CSR usually runs f
 
 ## Varying Cache Parameters
 
+Cachegrind is a simulator, so for this section I treat lower miss counts as the main performance signal rather than the `time_ms` printed during a Valgrind run.
+
+### Measured configurations
+
+| D1 configuration | Pointer D1 misses | CSR D1 misses | Pointer LLd misses | CSR LLd misses |
+| --- | ---: | ---: | ---: | ---: |
+| `16KB, 8-way, 64B` | 7,432,577 | 6,184,946 | 1,802,259 | 769,234 |
+| `32KB, 2-way, 64B` | 8,627,849 | 7,326,886 | 1,802,276 | 769,404 |
+| `32KB, 4-way, 64B` | 7,202,990 | 5,896,332 | 1,802,260 | 769,268 |
+| `32KB, 8-way, 64B` | 7,195,870 | 5,889,600 | 1,802,208 | 769,233 |
+| `32KB, 8-way, 32B` | 9,368,196 | 7,144,825 | 1,802,219 | 769,250 |
+| `32KB, 8-way, 128B` | 5,936,446 | 5,266,515 | 817,227 | 400,535 |
+
 ### Answer to Question 4
 
-I could not run the required cache-configuration experiments in this environment because Cachegrind is unavailable. However, the expected trends are:
+1. Increasing cache size from `16KB` to `32KB` reduced D1 misses for both implementations, but only modestly.
+   - Pointer: `7,432,577` -> `7,195,870` (`-3.2%`)
+   - CSR: `6,184,946` -> `5,889,600` (`-4.8%`)
 
-1. Increasing cache size should generally help both implementations, but especially the pointer graph, because more scattered edge nodes can remain cached.
-2. Increasing associativity should reduce conflict misses, which can help both versions, though the effect is often smaller than changing layout from pointer lists to CSR.
-3. Increasing cache line size should benefit CSR more, because adjacent neighbors are stored contiguously and a single cache line fetch brings in several useful entries.
-4. CSR should benefit more from larger cache lines than pointer graphs, because the pointer graph's next useful edge is often not adjacent in memory.
+   LLd misses were almost unchanged, so the larger L1 helped mainly by absorbing some extra first-level misses rather than changing last-level behavior.
+
+2. Increasing associativity helped by reducing conflict misses.
+   - Pointer D1 misses at `32KB, 64B`: `8,627,849` (2-way) -> `7,202,990` (4-way) -> `7,195,870` (8-way)
+   - CSR D1 misses at `32KB, 64B`: `7,326,886` (2-way) -> `5,896,332` (4-way) -> `5,889,600` (8-way)
+
+   Most of the benefit came from moving off 2-way associativity. The step from 4-way to 8-way helped only a little more.
+
+3. Increasing cache line size helped both implementations.
+   - Pointer D1 misses at `32KB, 8-way`: `9,368,196` (32B) -> `7,195,870` (64B) -> `5,936,446` (128B)
+   - CSR D1 misses at `32KB, 8-way`: `7,144,825` (32B) -> `5,889,600` (64B) -> `5,266,515` (128B)
+
+   Larger cache lines also cut LLd misses substantially at `128B`, because each miss brings in more neighboring data. This workload has enough spatial locality for larger lines to pay off.
+
+4. In these measured whole-program runs, CSR did **not** benefit more than the pointer graph in percentage terms from larger cache lines. The pointer version improved more because it started from a much worse miss profile, so it had more room to improve. However, CSR still had fewer misses than the pointer graph at every tested line size, so it remained the more cache-friendly layout overall.
 
 ## Final Notes
 
 - I did not modify the files that the README marked as off-limits (`graph_loader.c`, `benchmark.c`, `main.c`).
 - The required source files are complete and compile cleanly with the provided Makefile.
-- The code now contains short comments in the important logic paths to improve readability.
+- The code contains short comments in the important logic paths to improve readability.
 
 ## Reproducibility Commands
 
@@ -214,17 +244,13 @@ cd /home/bharti/cache_graph/starter
 make clean && make
 python3 /home/bharti/cache_graph/visible_checker.py /home/bharti/cache_graph/starter
 python3 scripts/gen_graph.py --kind er --n 50000 --deg 8 --seed 1 --out /tmp/cache_graph_er_50000_d8.txt
+
 ./graph_bench --impl=pointer --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=500
 ./graph_bench --impl=csr --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=500
-```
 
-If `valgrind` is available on another machine, these are the commands to complete the cache-study section:
+valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all ./graph_bench --impl=pointer --graph=tests/test_small.txt --source=0
+valgrind --tool=memcheck --leak-check=full --errors-for-leak-kinds=all ./graph_bench --impl=csr --graph=tests/test_small.txt --source=0
 
-```bash
-valgrind --tool=cachegrind ./graph_bench --impl=pointer --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=50
-valgrind --tool=cachegrind ./graph_bench --impl=csr --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=50
-valgrind --tool=cachegrind --D1=16384,4,64 ./graph_bench --impl=pointer --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=50
-valgrind --tool=cachegrind --D1=16384,4,64 ./graph_bench --impl=csr --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=50
-valgrind --tool=cachegrind --D1=32768,8,64 ./graph_bench --impl=pointer --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=50
-valgrind --tool=cachegrind --D1=32768,8,64 ./graph_bench --impl=csr --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=50
+valgrind --tool=cachegrind --cache-sim=yes --D1=32768,8,64 ./graph_bench --impl=pointer --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=10
+valgrind --tool=cachegrind --cache-sim=yes --D1=32768,8,64 ./graph_bench --impl=csr --graph=/tmp/cache_graph_er_50000_d8.txt --source=0 --repeat=10
 ```
